@@ -1,5 +1,6 @@
 import json
-from typing import Any, Iterable, Mapping, Optional, Type, TypeVar
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Type, TypeVar
 from abc import ABC, abstractmethod
 from huggingface_hub import hf_hub_download
 from requests import HTTPError  # type: ignore
@@ -7,8 +8,8 @@ import torch
 from torch import Tensor
 from torch.nn import Parameter
 
-from .loading_util import emplace_module_state_dict
-
+from .quantization import prepare_module_for_quantization
+from .util.serde import load_model_from_checkpoints, DeserializationParamBucket
 
 HF_MODEL_CONFIG = "config.json"
 HF_MODEL_CHECKPOINT = "pytorch_model.bin"
@@ -30,13 +31,15 @@ class FromPretrainedHFModel(ABC):
     @classmethod
     @abstractmethod
     def convert_hf_state_dict(
-        cls, params: Mapping[str, Parameter]
+        cls, params: Mapping[str, Tensor]
     ) -> Mapping[str, Tensor]:
         """Convert a state dict of a Hugging Face model to a valid
         state dict for the module.
 
-        params (Mapping[str, Parameter]): The state dict to convert.
-        RETURNS (Mapping[str, Tensor]): The converted state dict.
+        :param params:
+            The state dict to convert.
+        :returns:
+            The converted state dict.
         """
         raise NotImplementedError
 
@@ -51,9 +54,12 @@ class FromPretrainedHFModel(ABC):
         """Create the module from a Hugging Face model JSON-deserialized
         model configuration.
 
-        hf_config (Any): Hugging Face model configuration.
-        device (torch.device): Device on which to initialize the model.
-        RETURNS (Self): Module constructed using the configuration.
+        :param hf_config:
+            Hugging Face model configuration.
+        :param device:
+            Device on which to initialize the model.
+        :returns:
+            Module constructed using the configuration.
         """
         raise NotImplementedError
 
@@ -64,13 +70,20 @@ class FromPretrainedHFModel(ABC):
         revision: str = "main",
         *,
         device: Optional[torch.device] = None,
+        quantization_config: Optional[Dict[str, Any]] = None,
     ) -> Self:
         """Construct a module and load its parameters from Hugging Face Hub.
 
-        name (str): Model name.
-        revsion (str): Model revision.
-        device (torch.device): Device on which to initialize the model.
-        RETURNS (Self): Module with the parameters loaded.
+        :param name:
+            Model name.
+        :param revsion:
+            Model revision.
+        :param device:
+            Device on which to initialize the model.
+        :param quantization_config:
+            Configuration for loading quantized weights.
+        :returns:
+            Module with the parameters loaded.
         """
         # Download configuration and construct model.
         config_filename = _get_model_config_filepath(name, revision)
@@ -87,12 +100,22 @@ class FromPretrainedHFModel(ABC):
                 raise ValueError(f"Invalid torch dtype `{dtype_str}`")
             model.to(dtype=dtype)
 
+        # Prepare for quantization.
+        if quantization_config is not None:
+            tensor2param = prepare_module_for_quantization(model, quantization_config)  # type: ignore
+        else:
+            tensor2param = None
+
         # Download model and convert HF parameter names to ours.
         checkpoint_filenames = _get_model_checkpoint_filepaths(name, revision)
-        state_dict = _load_state_dict_checkpoints(checkpoint_filenames)
-        state_dict = cls.convert_hf_state_dict(state_dict)
+        load_model_from_checkpoints(
+            model,  # type:ignore
+            filepaths=checkpoint_filenames,
+            deserialization_buckets=model.deserialization_param_buckets(),
+            state_dict_converter=cls.convert_hf_state_dict,
+            tensor_to_param_converter=tensor2param,
+        )
 
-        emplace_module_state_dict(model, state_dict, device=device)  # type:ignore
         # Ensure that any non-persistent buffers are also moved to
         # the correct device.
         if device is not None:
@@ -114,6 +137,14 @@ class FromPretrainedHFModel(ABC):
         order to be an abstract base class.
         """
         ...
+
+    @abstractmethod
+    def deserialization_param_buckets(self) -> List[DeserializationParamBucket]:
+        """Returns a list of buckets into which parameters are sorted
+        during loading. Each bucket represents a group of parameters
+        that need to be deserialized together.
+        """
+        raise NotImplementedError
 
 
 def _get_model_config_filepath(name: str, revision: str) -> str:
@@ -170,15 +201,3 @@ def _get_model_checkpoint_filepaths(name: str, revision: str) -> Iterable[str]:
         filepaths.append(resolved_filename)
 
     return sorted(filepaths)
-
-
-def _load_state_dict_checkpoints(
-    checkpoint_filenames: Iterable[str],
-) -> Mapping[str, Any]:
-    state_dict = {}
-    for filename in checkpoint_filenames:
-        state_dict.update(
-            # Map to CPU first to support all devices.
-            torch.load(filename, map_location=torch.device("cpu"), weights_only=True)
-        )
-    return state_dict
