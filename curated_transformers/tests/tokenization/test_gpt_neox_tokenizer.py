@@ -384,3 +384,32 @@ def _check_toy_tokenizer(pieces):
             ]
         ),
     )
+
+
+def test_gpt_neox_chunk_validation(toy_tokenizer):
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([TextChunk("<|endoftext|>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([TextChunk("<|padding|>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([TextChunk("<|endoftext|> Brötchen <s>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([SpecialPieceChunk("<s>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([SpecialPieceChunk("<|endoftext|> Brötchen")])])
+
+    toy_tokenizer(
+        [
+            InputChunks(
+                [
+                    SpecialPieceChunk("<|endoftext|>"),
+                    TextChunk("Mw . - St ."),
+                    SpecialPieceChunk("<|padding|>"),
+                ]
+            )
+        ]
+    )

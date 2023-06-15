@@ -318,3 +318,36 @@ def test_bert_tokenizer_normalizer_preencoder():
             ]
         )
     ]
+
+
+def test_bert_chunk_validation(toy_tokenizer_from_tokenizer_json):
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json([InputChunks([TextChunk("[UNK]")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json([InputChunks([TextChunk("[CLS]")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json([InputChunks([TextChunk("Brötchen [SEP]")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json(
+            [InputChunks([SpecialPieceChunk("Brötchen")])]
+        )
+
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json(
+            [InputChunks([SpecialPieceChunk("[CLS] something")])]
+        )
+
+    toy_tokenizer_from_tokenizer_json(
+        [
+            InputChunks(
+                [
+                    SpecialPieceChunk("[CLS]"),
+                    TextChunk("Mw . - St ."),
+                    SpecialPieceChunk("[SEP]"),
+                ]
+            )
+        ]
+    )

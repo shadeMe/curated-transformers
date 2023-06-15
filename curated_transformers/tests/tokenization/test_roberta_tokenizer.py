@@ -3,6 +3,11 @@ import torch
 
 from curated_transformers._compat import has_hf_transformers
 from curated_transformers.tokenization import PiecesWithIds, RobertaTokenizer
+from curated_transformers.tokenization.chunks import (
+    InputChunks,
+    SpecialPieceChunk,
+    TextChunk,
+)
 
 from ..util import torch_assertclose
 from .util import compare_tokenizer_outputs_with_hf_tokenizer
@@ -269,4 +274,37 @@ def _check_toy_tokenizer(pieces):
                 ],
             ]
         ),
+    )
+
+
+def test_roberta_chunk_validation(toy_tokenizer_from_tokenizer_json):
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json([InputChunks([TextChunk("<s>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json([InputChunks([TextChunk("</s>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json([InputChunks([TextChunk("Brötchen <s>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json(
+            [InputChunks([SpecialPieceChunk("Brötchen")])]
+        )
+
+    with pytest.raises(ValueError):
+        toy_tokenizer_from_tokenizer_json(
+            [InputChunks([SpecialPieceChunk("</s> Brötchen")])]
+        )
+
+    toy_tokenizer_from_tokenizer_json(
+        [
+            InputChunks(
+                [
+                    SpecialPieceChunk("<s>"),
+                    TextChunk("Mw . - St ."),
+                    SpecialPieceChunk("</s>"),
+                ]
+            )
+        ]
     )

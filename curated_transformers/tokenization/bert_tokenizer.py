@@ -1,7 +1,7 @@
 import json
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Type, TypeVar
+from typing import Any, Dict, Iterable, List, Optional, Set, Type, TypeVar
 
 from curated_tokenizers import WordPieceProcessor
 
@@ -186,6 +186,10 @@ class BertTokenizer(WordPieceTokenizer, FromHFHub, FromPretrainedHFTokenizer):
         """
         super().__init__(vocab=vocab, special_pieces=special_pieces)
 
+        self.bos_piece = bos_piece
+        self.eos_piece = eos_piece
+        self.unk_piece = unk_piece
+
         self.normalizer = DefaultNormalizer(
             lowercase=lowercase, strip_accents=strip_accents
         )
@@ -283,6 +287,11 @@ class BertTokenizer(WordPieceTokenizer, FromHFHub, FromPretrainedHFTokenizer):
         serialized = tokenizer.backend_tokenizer.to_str(True)  # type: ignore
         deserialized = json.loads(serialized)
         return cls._convert_hf_tokenizer_json(hf_tokenizer=deserialized)
+
+    def _special_tokens(self) -> Set[str]:
+        special_tokens = {self.bos_piece, self.eos_piece, self.unk_piece}
+        special_tokens.update(self.special_piece_to_id.keys())
+        return special_tokens
 
 
 def _get_piece_id_or_fail(processor: WordPieceProcessor, piece: str):

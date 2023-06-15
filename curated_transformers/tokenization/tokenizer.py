@@ -1,10 +1,12 @@
+import re
 import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, List, Optional, TypeVar, Union
+from typing import Iterable, List, Optional, Set, TypeVar, Union
 
 import torch
+from ahocorasick import Automaton
 from torch import Tensor
 
 from .chunks import InputChunks, MergedInputChunks, SpecialPieceChunk, TextChunk
@@ -109,6 +111,7 @@ class Tokenizer(ABC):
     post_decoder: Optional[PostDecoder] = None
     pre_encoder: Optional[PreEncoder] = None
     post_encoder: Optional[PostEncoder] = None
+    _special_tokens_automaton: Optional[Automaton] = None
 
     def __call__(
         self, input: Union[Iterable[InputChunks], Iterable[str]]
@@ -157,6 +160,7 @@ class Tokenizer(ABC):
             Pieces in each sequence.
         """
         chunks = self._convert_strings(input)
+        self._validate_chunks(chunks)
 
         if self.normalizer is not None:
             chunks = self.normalizer(chunks)
@@ -179,6 +183,40 @@ class Tokenizer(ABC):
             for seq in input
         ]
 
+    def _validate_chunks(self, input: List[InputChunks]):
+        if self._special_tokens_automaton is None:
+            special_tokens = self._special_tokens()
+            if len(special_tokens) == 0:
+                return
+            self._special_tokens_automaton = automaton = Automaton()
+            for special_token in special_tokens:
+                automaton.add_word(special_token, special_token)
+            automaton.make_automaton()
+
+        assert self._special_tokens_automaton is not None
+        for chunks in input:
+            for piece_or_text in chunks:
+                if isinstance(piece_or_text, SpecialPieceChunk):
+                    matches = list(
+                        self._special_tokens_automaton.iter_long(piece_or_text.piece)
+                    )
+                    msg = f"Special piece chunk `{piece_or_text.piece}` is invalid"
+                    if len(matches) != 1:
+                        raise ValueError(msg)
+
+                    end_idx, value = matches[0]
+                    start_idx = end_idx - len(value) + 1
+                    if start_idx != 0 or end_idx != len(piece_or_text.piece) - 1:
+                        raise ValueError(msg)
+                elif isinstance(piece_or_text, TextChunk):
+                    # Dont do anything as special tokens in text chunks should be
+                    # tokenized as normal text.
+                    pass
+                else:
+                    raise ValueError(
+                        f"Input chunk has an unexpected type `{type(piece_or_text)}`"
+                    )
+
     @abstractmethod
     def _decode(
         self, input: Iterable[Iterable[int]], skip_special_pieces: bool
@@ -187,6 +225,11 @@ class Tokenizer(ABC):
 
     @abstractmethod
     def _encode(self, input: Iterable[MergedInputChunks]) -> PiecesWithIds:
+        ...
+
+    @abstractmethod
+    def _special_tokens(self) -> Set[str]:
+        """Special tokens supported by the tokenizer"""
         ...
 
 

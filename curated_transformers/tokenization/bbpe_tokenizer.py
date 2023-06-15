@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, cast
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, TypeVar, cast
 
 from curated_tokenizers import ByteBPEProcessor
 
@@ -79,6 +79,9 @@ class ByteBPETokenizer(Tokenizer, FromHFHub, FromPretrainedHFTokenizer):
             pieces.append(seq_pieces)
 
         return PiecesWithIds(ids=ids, pieces=pieces)
+
+    def _special_tokens(self) -> Set[str]:
+        return set(self.special_piece_to_id.keys())
 
     @classmethod
     def _convert_hf_tokenizer_json(

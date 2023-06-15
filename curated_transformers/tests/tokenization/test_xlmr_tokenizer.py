@@ -3,6 +3,11 @@ import torch
 
 from curated_transformers._compat import has_hf_transformers
 from curated_transformers.tokenization import PiecesWithIds
+from curated_transformers.tokenization.chunks import (
+    InputChunks,
+    SpecialPieceChunk,
+    TextChunk,
+)
 from curated_transformers.tokenization.xlmr_tokenizer import XlmrTokenizer
 
 from ..util import torch_assertclose
@@ -214,4 +219,33 @@ def _check_toy_tokenizer(pieces):
                 ],
             ]
         ),
+    )
+
+
+def test_xlmr_chunk_validation(toy_tokenizer):
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([TextChunk("<s>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([TextChunk("</s>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([TextChunk("Brötchen <unk>")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([SpecialPieceChunk("Brötchen")])])
+
+    with pytest.raises(ValueError):
+        toy_tokenizer([InputChunks([SpecialPieceChunk("</s> Brötchen")])])
+
+    toy_tokenizer(
+        [
+            InputChunks(
+                [
+                    SpecialPieceChunk("<s>"),
+                    TextChunk("Mw . - St ."),
+                    SpecialPieceChunk("</s>"),
+                ]
+            )
+        ]
     )
