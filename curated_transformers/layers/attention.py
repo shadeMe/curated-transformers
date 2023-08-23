@@ -9,7 +9,7 @@ from typing import Dict, Optional, Tuple, Type, Union
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.nn import Linear, Module
+from torch.nn import Embedding, Linear, Module
 
 from ..semver import Default, FutureMandatory
 from ..util.dataclass import DataclassAsDict
@@ -708,6 +708,48 @@ class ScaledDotProductAttention(Module):
         attn_values = self.dropout(attn_weights @ value)
 
         return attn_values
+
+
+class DisentangledAttention(Module):
+    """
+    Disentangled  attention (`He et al., 2020`_).
+
+    .. _He et al., 2020 : https://arxiv.org/abs/2006.03654
+    """
+
+    rel_position_embeddings: Embedding
+
+    def __init__(
+        self,
+        *,
+        n_rel_position_buckets: int,
+        embedding_width: int,
+        layer_norm_eps: Optional[float],
+        share_projections: bool,
+    ):
+        """
+
+
+        :param n_rel_position_buckets:
+
+        :param embedding_width:
+
+        :param layer_norm_eps:
+
+        :param share_projections:
+            If the projection matrices of the
+        """
+        pass
+
+    def forward(
+        self,
+        *,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: AttentionMask,
+    ) -> Tensor:
+        pass
 
 
 class SelfAttention(Module):
