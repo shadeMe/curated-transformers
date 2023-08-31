@@ -1,15 +1,16 @@
 import math
+import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, Flag
 from typing import Dict, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.nn import Embedding, Linear, Module
+from torch.nn import Dropout, Embedding, LayerNorm, Linear, Module
 
 from ..semver import Default, FutureMandatory
 from ..util.dataclass import DataclassAsDict
@@ -633,34 +634,12 @@ class AttentionLinearBiases(Module):
         return attention_scores + biases
 
 
-class ScaledDotProductAttention(Module):
+class AttentionScorer(Module, ABC):
     """
-    Scaled dot-product attention (`Vaswani et al., 2017`_).
-
-    .. _Vaswani et al., 2017: https://arxiv.org/abs/1706.03762
+    Base class of attention scoring implementations.
     """
 
-    linear_biases: Optional[AttentionLinearBiases]
-
-    def __init__(
-        self, *, dropout_prob: float, linear_biases: Optional[AttentionLinearBiases]
-    ):
-        """
-        Construct a scaled dot-product attention module.
-
-        :param dropout_prob:
-            Dropout to apply to the final hidden representation.
-        :param linear_biases:
-            ALiBi (`Press et al., 2022`_) for attention scores.
-            Not applied if ``None``.
-
-        .. _Press et al., 2022: https://arxiv.org/abs/2108.12409
-        """
-        super().__init__()
-
-        self.dropout = torch.nn.Dropout(p=dropout_prob)
-        self.linear_biases = linear_biases
-
+    @abstractmethod
     def forward(
         self,
         *,
@@ -670,7 +649,7 @@ class ScaledDotProductAttention(Module):
         attention_mask: AttentionMask,
     ) -> Tensor:
         """
-        Apply attention layer to the given key, query and value.
+        Apply attention scores to the given key, query and value.
 
         Sequence elements that are marked with `False` in the attention mask
         are ignored by the attention mechanism (if a mask is provided).
@@ -696,50 +675,36 @@ class ScaledDotProductAttention(Module):
 
             *Shape:* ``(batch_size, heads, seq_len, width)``
         """
-        model_width = key.shape[-1]
-        attn_scores = query @ key.transpose(-2, -1)
-        attn_scores /= math.sqrt(model_width)
-
-        if self.linear_biases is not None:
-            attn_scores = self.linear_biases(attention_scores=attn_scores)
-
-        attn_scores = attention_mask.apply_logit_mask(attn_scores)
-        attn_weights = attn_scores.softmax(dim=-1)
-        attn_values = self.dropout(attn_weights @ value)
-
-        return attn_values
+        raise NotImplementedError
 
 
-class DisentangledAttention(Module):
+class ScaledDotProductAttention(AttentionScorer):
     """
-    Disentangled  attention (`He et al., 2020`_).
+    Scaled dot-product attention (`Vaswani et al., 2017`_).
 
-    .. _He et al., 2020 : https://arxiv.org/abs/2006.03654
+    .. _Vaswani et al., 2017: https://arxiv.org/abs/1706.03762
     """
 
-    rel_position_embeddings: Embedding
+    linear_biases: Optional[AttentionLinearBiases]
 
     def __init__(
-        self,
-        *,
-        n_rel_position_buckets: int,
-        embedding_width: int,
-        layer_norm_eps: Optional[float],
-        share_projections: bool,
+        self, *, dropout_prob: float, linear_biases: Optional[AttentionLinearBiases]
     ):
         """
+        Construct a scaled dot-product attention module.
 
+        :param dropout_prob:
+            Dropout to apply to the final hidden representation.
+        :param linear_biases:
+            ALiBi (`Press et al., 2022`_) for attention scores.
+            Not applied if ``None``.
 
-        :param n_rel_position_buckets:
-
-        :param embedding_width:
-
-        :param layer_norm_eps:
-
-        :param share_projections:
-            If the projection matrices of the
+        .. _Press et al., 2022: https://arxiv.org/abs/2108.12409
         """
-        pass
+        super().__init__()
+
+        self.dropout = Dropout(p=dropout_prob)
+        self.linear_biases = linear_biases
 
     def forward(
         self,
@@ -749,7 +714,303 @@ class DisentangledAttention(Module):
         value: Tensor,
         attention_mask: AttentionMask,
     ) -> Tensor:
-        pass
+        if _TORCH_SDP.get():
+            attn_mask = attention_mask.logit_mask(query.dtype)
+
+            # Add AliBi to the logit mask
+            if self.linear_biases is not None:
+                biases = self.linear_biases.calculate_biases(key.size(-2)).to(
+                    dtype=query.dtype, device=query.device
+                )
+                bool_mask = attention_mask.bool_mask
+                attn_mask = torch.where(bool_mask, biases, attn_mask)
+
+            # We can't pass a bool mask, because it is currently broken:
+            # https://github.com/pytorch/pytorch/issues/103749
+            return F.scaled_dot_product_attention(
+                query=query,
+                key=key,
+                value=value,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout_prob if self.training else 0.0,
+            )
+        else:
+            width = key.shape[-1]
+            attn_scores = query @ key.transpose(-2, -1)
+            attn_scores /= math.sqrt(width)
+
+            if self.linear_biases is not None:
+                attn_scores = self.linear_biases(attention_scores=attn_scores)
+
+            attn_scores = attention_mask.apply_logit_mask(attn_scores)
+            attn_weights = attn_scores.softmax(dim=-1)
+            attn_values = self.dropout(attn_weights @ value)
+
+            return attn_values
+
+
+class RelativePositionAttentionType(Flag):
+    """
+    Type of relative position attention used in Disentangled
+    attention (`He et al., 2020`_). Can be bit-wise combined.
+
+    .. _He et al., 2020 : https://arxiv.org/abs/2006.03654
+    """
+
+    #: Position-to-content.
+    POSITION_TO_CONTENT = 1
+
+    #: Content-to-position.
+    CONTENT_TO_POSITION = 2
+
+    @classmethod
+    def from_string(cls, string: str) -> Optional["RelativePositionAttentionType"]:
+        if not string or string.lower() == "none":
+            return None
+        elif string == "p2c":
+            return RelativePositionAttentionType.POSITION_TO_CONTENT
+        elif string == "c2p":
+            return RelativePositionAttentionType.CONTENT_TO_POSITION
+        elif set(string.split("|")) == set(("c2p", "p2c")):
+            return (
+                RelativePositionAttentionType.POSITION_TO_CONTENT
+                | RelativePositionAttentionType.CONTENT_TO_POSITION
+            )
+        else:
+            raise ValueError(
+                "String representation of relative position attention type must "
+                "be a pipe-separated list one or more of the following: p2c, c2p. "
+                f"Got '{string}'"
+            )
+
+
+class DisentangledAttention(AttentionScorer):
+    """
+    Disentangled attention (`He et al., 2020`_).
+
+    .. _He et al., 2020 : https://arxiv.org/abs/2006.03654
+    """
+
+    def __init__(
+        self,
+        *,
+        dropout_prob: float,
+        hidden_width: int,
+        layer_norm_eps: Optional[float],
+        n_rel_position_buckets: int,
+        position_attention_type: RelativePositionAttentionType,
+        use_bias: bool,
+        device: Optional[torch.device] = None,
+    ):
+        """
+        Construct a disentangled attention module.
+
+        :param dropout_prob:
+            Dropout to apply on the relative position embeddings
+            and the attention weights.
+        :param hidden_width:
+            Hidden width of the transformer. Also used as the width
+            of the relative position embeddings.
+        :param layer_norm_eps:
+            Epsilon for layer normalization of the relative position
+            embeddings. If ``None``, layer normalization is not applied.
+        :param n_rel_position_buckets:
+            Number of position buckets for the relative position embeddings.
+            This is independent of the absolute position embeddings. The size
+            of these embeddings will be ``2 * n_rel_position_buckets``.
+        :param position_attention_type:
+            Bit-wise combination of relative position attentions to apply.
+        :param use_bias:
+            Use biases for linear layers.
+        :param device:
+            Device on which the module is to be initialized.
+        """
+        super().__init__()
+
+        if n_rel_position_buckets <= 0:
+            raise ValueError(
+                "Bucket size for relative position embeddings must be > 0, "
+                f"got {n_rel_position_buckets}"
+            )
+
+        self.position_attention_type = position_attention_type
+
+        self.rel_position_query = Linear(
+            hidden_width,
+            hidden_width,
+            bias=use_bias,
+            device=device,
+        )
+        self.rel_position_key = Linear(
+            hidden_width,
+            hidden_width,
+            bias=use_bias,
+            device=device,
+        )
+
+        self.rel_position_embeddings = Embedding(
+            num_embeddings=n_rel_position_buckets * 2,
+            embedding_dim=hidden_width,
+            device=device,
+        )
+        if layer_norm_eps is None:
+            self.rel_position_embeddings_layer_norm = None
+        else:
+            self.rel_position_embeddings_layer_norm = LayerNorm(
+                hidden_width, eps=layer_norm_eps, device=device
+            )
+
+        self.dropout = Dropout(p=dropout_prob)
+
+    def _calculate_rel_positions(
+        self, query_len: int, key_len: int, device: torch.device
+    ) -> Tensor:
+        # Translate relative positions into buckets that can be used to
+        # look up the relative position embeddings. Clamp the positions
+        # outside the maximum distance to the same bucket.
+        max_distance = self.rel_position_embeddings.weight.size(0)
+        n_buckets = max_distance // 2
+        buckets_midpoint = n_buckets // 2
+
+        rel_positions = (
+            torch.arange(query_len)[:, None] - torch.arange(key_len)[None, :]
+        )
+        rel_positions_abs = rel_positions.abs()
+        mask_within_range = rel_positions_abs < buckets_midpoint
+
+        positions_within_range = torch.where(
+            mask_within_range,
+            buckets_midpoint - 1,
+            rel_positions_abs,
+        )
+        bins_outside_range = (
+            buckets_midpoint
+            + (
+                torch.log(positions_within_range / buckets_midpoint)
+                / math.log((max_distance - 1) / buckets_midpoint)
+                * (buckets_midpoint - 1)
+            ).ceil_()
+        ) * rel_positions.sign()
+
+        binned_positions = (
+            torch.where(mask_within_range, rel_positions, bins_outside_range)
+            + n_buckets
+        ).to(dtype=torch.long, device=device)
+        return binned_positions
+
+    def _calculate_scale_factor(self) -> float:
+        scale = 1.0
+        if (
+            RelativePositionAttentionType.CONTENT_TO_POSITION
+            in self.position_attention_type
+        ):
+            scale += 1.0
+        if (
+            RelativePositionAttentionType.POSITION_TO_CONTENT
+            in self.position_attention_type
+        ):
+            scale += 1.0
+
+        return scale
+
+    def _calculate_positional_bias(
+        self, query: Tensor, key: Tensor, scale_factor: float
+    ) -> Tensor:
+        # (1, emb_len, width)
+        pos_embeddings = self.rel_position_embeddings.weight.unsqueeze(0)
+        if self.rel_position_embeddings_layer_norm is not None:
+            pos_embeddings = self.rel_position_embeddings_layer_norm(pos_embeddings)
+        pos_embeddings = self.dropout(pos_embeddings)
+
+        (
+            n_batch,
+            n_heads,
+            _,
+            width,
+        ) = query.shape
+        scale = math.sqrt(width * scale_factor)
+        n_buckets = pos_embeddings.size(1) // 2
+
+        # (1, 1, query_len, key_len)
+        positions = (
+            self._calculate_rel_positions(
+                query_len=query.size(-2),
+                key_len=key.size(-2),
+                device=pos_embeddings.device,
+            )
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )
+
+        scores = 0.0
+        if (
+            RelativePositionAttentionType.CONTENT_TO_POSITION
+            in self.position_attention_type
+        ):
+            pos_key = split_heads(self.rel_position_key(pos_embeddings), n_heads)
+            pos_attn = query @ pos_key.transpose(-2, -1)
+
+            positions = torch.clamp(positions, 0, n_buckets * 2 - 1)
+            pos_attn = torch.gather(
+                pos_attn, dim=-1, index=positions.expand([n_batch, n_heads, -1, -1])
+            )
+            scores += pos_attn / scale
+
+        if (
+            RelativePositionAttentionType.POSITION_TO_CONTENT
+            in self.position_attention_type
+        ):
+            pos_query = split_heads(self.rel_position_query(pos_embeddings), n_heads)
+            pos_attn = key @ pos_query.transpose(-2, -1)
+
+            if query.size(-2) != key.size(-2):
+                # (1, 1, key_len, key_len)
+                positions = (
+                    self._calculate_rel_positions(
+                        query_len=key.size(-2),
+                        key_len=key.size(-2),
+                        device=pos_embeddings.device,
+                    )
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                )
+            positions = torch.clamp(-positions, 0, n_buckets * 2 - 1)
+            pos_attn = torch.gather(
+                pos_attn, dim=-1, index=positions.expand([n_batch, n_heads, -1, -1])
+            )
+            scores += pos_attn / scale
+
+        return scores.to(dtype=query.dtype)
+
+    def forward(
+        self,
+        *,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: AttentionMask,
+    ) -> Tensor:
+        if query.size(1) != key.size(1):
+            raise ValueError(
+                "Disentangled attention can only be used with a uniform "
+                "number of attention heads for query, key and value"
+            )
+
+        width = key.shape[-1]
+        scale_factor = self._calculate_scale_factor()
+
+        attn_scores = query @ key.transpose(-2, -1)
+        attn_scores /= math.sqrt(width * scale_factor)
+
+        if self.position_attention_type is not None:
+            attn_scores += self._calculate_positional_bias(query, key, scale_factor)
+
+        attn_scores = attention_mask.apply_logit_mask(attn_scores)
+        # The dropout is applied to the attention scores instead of the final output.
+        attn_weights = self.dropout(attn_scores.softmax(dim=-1))
+        attn_values = attn_weights @ value
+
+        return attn_values
 
 
 class SelfAttention(Module):
@@ -765,11 +1026,10 @@ class SelfAttention(Module):
         self,
         *,
         attention_heads: AttentionHeads,
-        dropout_prob: float,
+        attention_scorer: AttentionScorer,
         hidden_width: int,
         qkv_mode: QkvMode,
         rotary_embeds: Optional[QueryKeyRotaryEmbeddings] = None,
-        attention_biases: Optional[AttentionLinearBiases] = None,
         use_bias: bool,
         device: Optional[torch.device] = None,
     ):
@@ -779,12 +1039,12 @@ class SelfAttention(Module):
 
         :param attention_heads:
             Attention head configuration.
+        :param attention_scorer:
+            Attention scorer used to calculate the attention values.
         :param dropout_prob:
             Dropout to apply between the self-attention and output layers.
         :param hidden_width:
             Hidden width of the layer.
-        :param attention_biases:
-            ALiBi biases. ALiBi will not be used when set to ``None``.
         :param qkv_mode:
             Handling mode for query, key and value.
         :param rotary_embeds:
@@ -798,7 +1058,6 @@ class SelfAttention(Module):
 
         super().__init__()
 
-        self.dropout_prob = dropout_prob
         self.attention_heads = attention_heads
         if hidden_width % attention_heads._n_query_heads != 0:
             raise ValueError(
@@ -808,13 +1067,9 @@ class SelfAttention(Module):
 
         self.head_width = hidden_width // attention_heads._n_query_heads
         self.qkv_mode = qkv_mode
-        self.use_alibi = attention_biases is not None
 
         self.rotary_embeds = rotary_embeds
-
-        self.attention = ScaledDotProductAttention(
-            dropout_prob=dropout_prob, linear_biases=attention_biases
-        )
+        self.attention_scorer = attention_scorer
 
         if (
             qkv_mode == QkvMode.MERGED_SPLIT_BEFORE
@@ -919,35 +1174,22 @@ class SelfAttention(Module):
             causal_mask = create_causal_mask(query, key)
             combined_mask = combined_mask.merge_mask(causal_mask)
 
-        if _TORCH_SDP.get():
-            attn_mask = combined_mask.logit_mask(query.dtype)
-
-            # Add AliBi to the logit mask
-            if self.use_alibi:
-                assert self.attention.linear_biases is not None
-                biases = self.attention.linear_biases.calculate_biases(key.size(-2)).to(
-                    dtype=query.dtype, device=query.device
-                )
-                bool_mask = combined_mask.bool_mask
-                attn_mask = torch.where(bool_mask, biases, attn_mask)
-
-            # We can't pass a bool mask, because it is currently broken:
-            # https://github.com/pytorch/pytorch/issues/103749
-            attn = F.scaled_dot_product_attention(
-                query=query,
-                key=key,
-                value=value,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout_prob if self.training else 0.0,
+        if _TORCH_SDP.get() and not isinstance(
+            self.attention_scorer, ScaledDotProductAttention
+        ):
+            warn_msg = (
+                f"PyTorch SDP attention requires the `{ScaledDotProductAttention.__name__}` "
+                f"attention scorer. Currently using the `{type(self.attention_scorer).__name__}` scorer"
             )
-        else:
-            attn = self.attention(
-                query=query,
-                key=key,
-                value=value,
-                attention_mask=combined_mask,
-            )
+            warnings.filterwarnings("once", message=warn_msg)
+            warnings.warn(message=warn_msg)
 
+        attn = self.attention_scorer(
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=combined_mask,
+        )
         attn = combine_heads(attn)
 
         output = self.output(attn)

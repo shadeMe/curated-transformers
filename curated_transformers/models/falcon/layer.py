@@ -10,6 +10,7 @@ from ...layers.attention import (
     AttentionMask,
     KeyValueCache,
     QkvMode,
+    ScaledDotProductAttention,
     SelfAttention,
 )
 from ...layers.embeddings import QueryKeyRotaryEmbeddings
@@ -62,12 +63,14 @@ class OldFalconDecoderLayer(Module):
             else None
         )
         self.mha = SelfAttention(
-            attention_biases=attention_biases,
-            dropout_prob=attention_config.dropout_prob,
             hidden_width=hidden_width,
             attention_heads=AttentionHeads.key_value_broadcast(
                 n_query_heads=attention_config.n_query_heads,
                 n_key_value_heads=attention_config.n_key_value_heads,
+            ),
+            attention_scorer=ScaledDotProductAttention(
+                dropout_prob=attention_config.dropout_prob,
+                linear_biases=attention_biases,
             ),
             rotary_embeds=rotary_embeds,
             qkv_mode=QkvMode.MERGED_SPLIT_AFTER
